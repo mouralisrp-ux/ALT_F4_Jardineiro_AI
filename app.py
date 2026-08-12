@@ -1,12 +1,16 @@
-import sys, os, json, time, threading, traceback
+import sys, os, json, time, threading, traceback, logging
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
-    QPushButton, QListWidget, QMessageBox, QSpinBox, QGroupBox
+    QPushButton, QListWidget, QMessageBox, QSpinBox, QGroupBox, QListWidgetItem
 )
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Qt
 from pynput import keyboard, mouse
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 APP_DIR = Path(os.getenv("LOCALAPPDATA", Path.home())) / "ALT_F4_Jardineiro_AI"
 DATA = APP_DIR / "sequences"
@@ -20,6 +24,8 @@ class Recorder(QObject):
         super().__init__()
         self.events = []
         self.running = False
+        self.kl = None
+        self.ml = None
 
     def start(self):
         if self.running:
@@ -27,11 +33,16 @@ class Recorder(QObject):
         self.events = []
         self.t0 = time.perf_counter()
         self.running = True
-        self.kl = keyboard.Listener(on_press=self.kp, on_release=self.kr)
-        self.ml = mouse.Listener(on_move=self.mm, on_click=self.mc)
-        self.kl.start()
-        self.ml.start()
-        self.status.emit("A gravar... F9 termina e guarda.")
+        try:
+            self.kl = keyboard.Listener(on_press=self.kp, on_release=self.kr)
+            self.ml = mouse.Listener(on_move=self.mm, on_click=self.mc)
+            self.kl.start()
+            self.ml.start()
+            self.status.emit("A gravar... F9 termina e guarda.")
+        except Exception as e:
+            logger.error(f"Error starting recording: {e}")
+            self.running = False
+            self.status.emit(f"Erro ao iniciar gravação: {e}")
 
     def t(self):
         return round(time.perf_counter() - self.t0, 4)
@@ -44,32 +55,46 @@ class Recorder(QObject):
 
     def kp(self, k):
         if self.running:
-            self.events.append({"t": self.t(), "type": "key_down", "key": self.key(k)})
+            try:
+                self.events.append({"t": self.t(), "type": "key_down", "key": self.key(k)})
+            except Exception as e:
+                logger.error(f"Error recording key press: {e}")
 
     def kr(self, k):
         if self.running:
-            self.events.append({"t": self.t(), "type": "key_up", "key": self.key(k)})
+            try:
+                self.events.append({"t": self.t(), "type": "key_up", "key": self.key(k)})
+            except Exception as e:
+                logger.error(f"Error recording key release: {e}")
 
     def mm(self, x, y):
         if self.running:
-            self.events.append({"t": self.t(), "type": "mouse_move", "x": x, "y": y})
+            try:
+                self.events.append({"t": self.t(), "type": "mouse_move", "x": x, "y": y})
+            except Exception as e:
+                logger.error(f"Error recording mouse move: {e}")
 
     def mc(self, x, y, b, pressed):
         if self.running:
-            self.events.append({
-                "t": self.t(), "type": "mouse_click", "x": x, "y": y,
-                "button": str(b), "pressed": pressed
-            })
+            try:
+                self.events.append({
+                    "t": self.t(), "type": "mouse_click", "x": x, "y": y,
+                    "button": str(b), "pressed": pressed
+                })
+            except Exception as e:
+                logger.error(f"Error recording mouse click: {e}")
 
     def stop(self):
         if not self.running:
             return
         self.running = False
         try:
-            self.kl.stop()
-            self.ml.stop()
-        except Exception:
-            pass
+            if self.kl:
+                self.kl.stop()
+            if self.ml:
+                self.ml.stop()
+        except Exception as e:
+            logger.error(f"Error stopping listeners: {e}")
         self.finished.emit(self.events)
         self.status.emit(f"Gravação terminada: {len(self.events)} eventos.")
 
@@ -86,12 +111,22 @@ class Player(QObject):
 
     def run(self, events, reps):
         def job():
-            kb = keyboard.Controller()
-            ms = mouse.Controller()
+            try:
+                kb = keyboard.Controller()
+                ms = mouse.Controller()
+            except Exception as e:
+                logger.error(f"Error creating controllers: {e}")
+                self.finished.emit(f"Erro ao criar controladores: {e}")
+                return
+                
             self.stop_flag = False
 
             try:
                 for r in range(reps):
+                    if self.stop_flag:
+                        self.finished.emit("Execução interrompida.")
+                        return
+                        
                     self.status.emit(f"Execução {r + 1}/{reps}")
                     last = 0
                     for e in events:
@@ -112,12 +147,13 @@ class Player(QObject):
                             elif e["type"] == "mouse_click":
                                 b = getattr(mouse.Button, e["button"].split(".")[-1])
                                 (ms.press if e["pressed"] else ms.release)(b)
-                        except Exception:
-                            # Ignore one malformed event and continue.
+                        except Exception as ex:
+                            logger.warning(f"Skipping malformed event: {ex}")
                             pass
 
                 self.finished.emit("Execução concluída.")
             except Exception as exc:
+                logger.error(f"Error during playback: {exc}")
                 self.finished.emit(f"Erro: {exc}")
 
         threading.Thread(target=job, daemon=True).start()
@@ -135,6 +171,7 @@ class App(QWidget):
 
         self.rec = Recorder()
         self.player = Player()
+        self.hot = None
         self.build()
 
         self.rec.finished.connect(self.saved)
@@ -142,12 +179,16 @@ class App(QWidget):
         self.player.status.connect(self.status.setText)
         self.player.finished.connect(self.status.setText)
 
-        self.hot = keyboard.GlobalHotKeys({
-            "<f8>": self.startrec,
-            "<f9>": self.stoprec,
-            "<f10>": self.stopplay
-        })
-        self.hot.start()
+        try:
+            self.hot = keyboard.GlobalHotKeys({
+                "<f8>": self.startrec,
+                "<f9>": self.stoprec,
+                "<f10>": self.stopplay
+            })
+            self.hot.start()
+        except Exception as e:
+            logger.error(f"Error setting up global hotkeys: {e}")
+            self.status.setText(f"Atalhos globais indisponíveis: {e}")
 
     def build(self):
         layout = QVBoxLayout(self)
@@ -193,8 +234,12 @@ class App(QWidget):
 
     def load(self):
         self.list.clear()
-        for p in sorted(DATA.glob("*.json")):
-            self.list.addItem(p.stem)
+        try:
+            for p in sorted(DATA.glob("*.json")):
+                self.list.addItem(p.stem)
+        except Exception as e:
+            logger.error(f"Error loading sequences: {e}")
+            self.status.setText(f"Erro ao carregar sequências: {e}")
 
     def startrec(self):
         self.rec.start()
@@ -208,13 +253,17 @@ class App(QWidget):
         if not safe:
             safe = f"sequencia_{int(time.time())}"
 
-        path = DATA / f"{safe}.json"
-        path.write_text(
-            json.dumps({"name": safe, "events": events}, ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-        self.load()
-        self.status.setText(f"Guardado: {safe}")
+        try:
+            path = DATA / f"{safe}.json"
+            path.write_text(
+                json.dumps({"name": safe, "events": events}, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            self.load()
+            self.status.setText(f"Guardado: {safe}")
+        except Exception as e:
+            logger.error(f"Error saving sequence: {e}")
+            self.status.setText(f"Erro ao guardar: {e}")
 
     def play(self):
         item = self.list.currentItem()
@@ -226,6 +275,7 @@ class App(QWidget):
             data = json.loads((DATA / f"{item.text()}.json").read_text(encoding="utf-8"))
             self.player.run(data.get("events", []), self.reps.value())
         except Exception as exc:
+            logger.error(f"Error loading sequence: {exc}")
             QMessageBox.critical(self, "Erro", f"Não foi possível abrir a sequência:\n{exc}")
 
     def stopplay(self):
@@ -236,9 +286,10 @@ class App(QWidget):
         try:
             self.rec.stop()
             self.player.stop()
-            self.hot.stop()
-        except Exception:
-            pass
+            if self.hot:
+                self.hot.stop()
+        except Exception as e:
+            logger.error(f"Error during shutdown: {e}")
         event.accept()
 
 if __name__ == "__main__":
